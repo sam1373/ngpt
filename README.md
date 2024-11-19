@@ -40,37 +40,23 @@ The main difference in this codebase lies in the Transformer models:
 1. **Modifications**: 
    - `model.py` includes both the **original** and **normalized Transformer** models.
    - `train.py` contains the **normalization procedure** for training.
-   - The architecture follows the paper's specifications, except for vocabulary size.
+   - The architecture follows the paper's specifications. The vocabulary size is different and this changes the scale of loss values. 
 
 2. **Dependencies**:
    - **nanoGPT**: To generate the data folder with OpenWebText, see the [nanoGPT repository](https://github.com/karpathy/nanoGPT).
    - **FlashAttention**: FlashAttention from [Dao-AILab](https://github.com/Dao-AILab/flash-attention) (BSD 3-Clause License) is used, though PyTorch’s default attention can be substituted if preferred.
-   - We used [this](https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-24-04.html) NVIDIA container image for PyTorch.
 
 ## **Getting Started**
 
 ### **Running the Code**
 
-To start the training process with defined hyperparameters, execute `launcher.sh`. 
+To start the training process with defined hyperparameters, execute `launcher.sh`.
 
 ### **Experiment Replication**
 
-This code reproduces the experiments from our paper which were conducted using NVIDIA's internal libraries. Specifically, we reproduce the reported speedups:
-- **4x** speedup for a sequence length of 1k
-- **10x** speedup for a sequence length of 4k
+The paper demonstrates a speedup of nGPT w.r.t. the baseline GPT in three settings: 1k, 4k and 8k context length. For 1k context length, **the expected speedup is of a factor of 4 at about 200k iteration steps** of training (i.e., the validation loss if on par with the one of the baseline GPT after 800k steps). **For shorter training runs, the expected speedup is smaller**. For 4k context length, the expected speedup is of a factor of 10. Similarly, the longer the training the greater the speedup.
 
-Here, we tested only the 0.5B model, as the paper suggests that the speedup numbers for the 0.5B and 1B models are very similar. The speedup factor also depends on the training budget: the longer the run, the greater the speedup, meaning the reported numbers can be exceeded.
-
----
-
-![Model Comparison](./nGPTnanoGPT.png)
-
----
-
-### **Notable Differences and Observations**
-
-- **Learning Rate**: The baseline GPT in nanoGPT diverges at higher learning rates, unlike our internal code. Thus, optimal learning rates differ slightly.
-- **Hyperparameter Tuning**: Below is a summary of final validation loss values across hyperparameter settings (tested on 64 GPUs in parallel). Results may vary based on the GPU.
+When reproducing these experiments using nanoGPT codebase, we introduced a few modifications to reflect the experimental setup used in the paper. First, we use RoPE for positional embedding instead of the absolution positional embedding. Second, we use SwiGLU instead of GELU which was the default in nanoGPT. Third, the original nanoGPT code can perform operations using lower-precision arithmetic (e.g., with bfloat16), however, the storage of parameters is happening in float32. In order to reflect our experimental setup of the paper where parameters of matrices are in bfloat16, we also set bfloat16 as the dtype of network parameters (all except embeddings). Apparatently, the change from float32 to bfloat16 only moderately affects nGPT but greatly degrades performance of the baseline GPT. In fact, the speedups that we observe in this reimplementation are greater than the ones of our internal experiments. This suggests that the treatment of precision-critical operations in this code is rather suboptimal and this affects the baseline GPT much more. Thus, **the demonstrated here speedup factors are greater than they normally should be and reported in the paper**. One possible explanation could be that nGPT is less sensitive to low-precision arithmetic/storage than the baseline GPT. As a result, one could see a smaller speedup when using float32 precision and a greater speedup when using bfloat16 and even lower precision. However, it also could be that something is wrong in this implementation. We would love to iterate over this code to make it a better approximation of our internal experiments and overall to attain a reproducible experimental setup. 
 
 ---
 

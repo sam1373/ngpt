@@ -69,14 +69,14 @@ class Block(nn.Module):
         super().__init__()
         self.config = config
 
-        self.key = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        self.query = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        self.value = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        self.att_c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.key = nn.Linear(config.n_embd, config.n_embd, bias=config.bias, dtype=torch.bfloat16)
+        self.query = nn.Linear(config.n_embd, config.n_embd, bias=config.bias, dtype=torch.bfloat16)
+        self.value = nn.Linear(config.n_embd, config.n_embd, bias=config.bias, dtype=torch.bfloat16)
+        self.att_c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias, dtype=torch.bfloat16)
         
-        self.c_fc    = nn.Linear(config.n_embd, 2 * 4 * config.n_embd, bias=config.bias)
+        self.c_fc    = nn.Linear(config.n_embd, 2 * 4 * config.n_embd, bias=config.bias, dtype=torch.bfloat16)
         self.silu    = nn.SiLU()
-        self.mlp_c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.mlp_c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias, dtype=torch.bfloat16)
 
         if (config.use_nGPT == 0):
             self.rmsnorm_att = RMSNorm(config.n_embd)
@@ -108,12 +108,13 @@ class Block(nn.Module):
     def forward(self, h):
         B, T, C = h.size()
 
+        hin = h
         if (self.config.use_nGPT == 0):
-            h = self.rmsnorm_att(h)
+            hin = self.rmsnorm_att(h)
         
-        q = self.query(h)
-        k = self.key(h)
-        v = self.value(h)
+        q = self.query(hin)
+        k = self.key(hin)
+        v = self.value(hin)
 
         q = q.view(B, T, self.config.n_head, self.config.n_embd // self.config.n_head) 
         k = k.view(B, T, self.config.n_head, self.config.n_embd // self.config.n_head)
@@ -151,10 +152,10 @@ class Block(nn.Module):
             res = A_norm + lr * (B_norm - A_norm)
             h = self.justnorm(res)
 
-    
+        hin = h
         if (self.config.use_nGPT == 0):
-            h = self.rmsnorm_mlp(h)
-        uv = self.c_fc(h)
+            hin = self.rmsnorm_mlp(h)
+        uv = self.c_fc(hin)
         if (self.config.use_nGPT == 1):
             suv = (self.suv * ((self.suv_init_value/self.suv_init_scaling) * (self.config.n_embd ** 0.5))) 
             uv = suv * uv  
