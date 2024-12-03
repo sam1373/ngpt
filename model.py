@@ -139,8 +139,8 @@ class Block(nn.Module):
 
         sinusoidal_pos = get_sinusoidal_embeddings(T, self.config.n_embd // self.config.n_head).to(device=q.device)
         q, k = apply_rotary_position_embeddings(sinusoidal_pos, q.transpose(1, 2), k.transpose(1, 2))
-        q = q.transpose(2, 1)
-        k = k.transpose(2, 1)
+        #q = q.transpose(2, 1)
+        #k = k.transpose(2, 1)
 
         if (self.config.use_nGPT == 1):
             sqk = (self.sqk * (self.sqk_init_value/self.sqk_init_scaling)).view(1, 1, self.config.n_head, self.config.n_embd // self.config.n_head)
@@ -201,11 +201,10 @@ class Block(nn.Module):
 
     def attn_func(self, q, k, v, softmax_scale=1.0, q_g=None, k_g=None, se_w_size=None):
         if self.config.use_flash_attn:
+            q = q.transpose(2, 1)
+            k = k.transpose(2, 1)
             return flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=softmax_scale, causal=True, window_size=(-1, -1), alibi_slopes=None, deterministic=True)
 
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
 
         attn = torch.matmul(q, k.transpose(-2, -1)) * softmax_scale
         attn = self.apply_right_aligned_causal_mask(attn)
@@ -221,7 +220,6 @@ class Block(nn.Module):
         attn = self.softmax_like(attn)
 
         out = torch.matmul(attn, v)
-
         out = out.transpose(1, 2)
 
         return out
