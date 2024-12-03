@@ -37,8 +37,10 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-import numpy as np
-from flash_attn import flash_attn_qkvpacked_func, flash_attn_func
+try:
+    from flash_attn import flash_attn_qkvpacked_func, flash_attn_func
+except ImportError:
+    flash_attn_func = None
 
 
 def apply_rotary_position_embeddings(sinusoidal_pos, q, k):
@@ -259,17 +261,17 @@ class Block(nn.Module):
         t_start = attn_scores.shape[-1] - attn_scores.shape[-2]
         device = attn_scores.device
 
-        if self.training and self.local_heads_during_training > 0:
-            if self.local_heads_random:
-                head_indices = torch.randperm(self.n_head)[:self.local_heads_during_training]
+        if self.training and self.config.local_heads_during_training > 0:
+            if self.config.local_heads_random:
+                head_indices = torch.randperm(self.n_head)[:self.config.local_heads_during_training]
             else:
-                head_indices = torch.arange(self.local_heads_during_training, device=device)
+                head_indices = torch.arange(self.config.local_heads_during_training, device=device)
             local_heads_mask = torch.zeros(self.n_head, device=device, dtype=torch.bool)
             local_heads_mask[head_indices] = True
 
             i = torch.arange(t_start, t_end, device=device).view(-1, 1)
             j = torch.arange(0, t_end, device=device).view(1, -1)
-            local_mask = (i - j >= self.aug_window_size).bool()
+            local_mask = (i - j >= self.config.aug_window_size).bool()
             local_mask = local_mask.unsqueeze(0).unsqueeze(0)
             local_heads_mask_expanded = local_heads_mask.view(1, self.n_head, 1, 1)
             attn_scores = attn_scores.masked_fill(local_heads_mask_expanded & local_mask, float('-inf'))

@@ -46,14 +46,12 @@ import math
 import pickle
 import sys
 from contextlib import nullcontext
-from typing import Callable, Optional, Tuple, List
 
 import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 from model import GPTConfig, GPT
-from torch.nn import functional as F
 from datetime import timedelta
 
 # -----------------------------------------------------------------------------
