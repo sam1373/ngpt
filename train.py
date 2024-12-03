@@ -58,7 +58,7 @@ from datetime import timedelta
 
 # -----------------------------------------------------------------------------
 # I/O
-
+out_dir = 'out'
 eval_interval = 1000
 log_interval = 10
 eval_iters = 200
@@ -163,7 +163,6 @@ tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * bl
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 
-out_dir='./'
 if master_process:
     if not os.path.exists(out_dir):
         os.makedirs(out_dir)
