@@ -203,6 +203,9 @@ class Block(nn.Module):
         if self.config.use_flash_attn:
             return flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=softmax_scale, causal=True, window_size=(-1, -1), alibi_slopes=None, deterministic=True)
 
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
 
         attn = torch.matmul(q, k.transpose(-2, -1)) * softmax_scale
         attn = self.apply_right_aligned_causal_mask(attn)
@@ -218,6 +221,8 @@ class Block(nn.Module):
         attn = self.softmax_like(attn)
 
         out = torch.matmul(attn, v)
+
+        out = out.transpose(1, 2)
 
         return out
 
