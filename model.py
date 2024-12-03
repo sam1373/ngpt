@@ -78,6 +78,16 @@ class Block(nn.Module):
         self.silu    = nn.SiLU()
         self.mlp_c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias, dtype=torch.bfloat16)
 
+        self.iblock = iblock
+
+        if self.config.softmax_like == 'soft_score_threshold' or self.config.softmax_like == 'score_threshold':
+            #initialize learnable threshold and steepness per head
+            self.thr_c = nn.Parameter(2.0 * torch.ones(self.n_head, dtype=torch.float32), requires_grad=self.config.learned_threshold)
+            self.stp = nn.Parameter(10.0 * torch.ones(self.n_head, dtype=torch.float32), requires_grad=False)
+
+            print("thr_c:", self.thr_c)
+            print("stp:", self.stp)
+
         if (config.use_nGPT == 0):
             self.rmsnorm_att = RMSNorm(config.n_embd)
             self.rmsnorm_mlp = RMSNorm(config.n_embd)
@@ -106,6 +116,11 @@ class Block(nn.Module):
         return res
 
     def forward(self, h):
+        sqrt_head_dim = (self.config.n_embd / self.config.n_head) ** 0.5
+        if (self.config.use_nGPT == 0): softmax_scale = 1.0 / sqrt_head_dim
+        if (self.config.use_nGPT == 1): softmax_scale = sqrt_head_dim
+
+
         B, T, C = h.size()
 
         hin = h
@@ -130,10 +145,8 @@ class Block(nn.Module):
             q = sqk * self.justnorm(q)  
             k = sqk * self.justnorm(k)  
 
-        sqrt_head_dim = (self.config.n_embd / self.config.n_head) ** 0.5
-        if (self.config.use_nGPT == 0): softmax_scale = 1.0 / sqrt_head_dim 
-        if (self.config.use_nGPT == 1): softmax_scale = sqrt_head_dim 
-        y = flash_attn_func(q.to(dtype=torch.bfloat16), k.to(dtype=torch.bfloat16), v.to(dtype=torch.bfloat16), dropout_p=0.0, softmax_scale=softmax_scale, causal=True, window_size=(-1, -1), alibi_slopes=None, deterministic=True)
+        y = self.attn_maybe_extended(q.to(dtype=torch.bfloat16), k.to(dtype=torch.bfloat16), v.to(dtype=torch.bfloat16), softmax_scale=softmax_scale)
+
         y = y.to(dtype=q.dtype)
         y = y.contiguous().view(B, T, self.config.n_embd)
 
@@ -178,6 +191,92 @@ class Block(nn.Module):
 
         return h
 
+    def attn_maybe_extended(self, q, k, v, softmax_scale, q_g=None, k_g=None):
+        if self.config.attn_chunked:
+            return self.attn_func(q, k, v, softmax_scale, q_g, k_g)
+        else:
+            return self.attn_func(q, k, v, softmax_scale, q_g, k_g)
+
+    def attn_func(self, q, k, v, softmax_scale=1.0, q_g=None, k_g=None, se_w_size=None):
+        if self.config.use_flash_attn:
+            return flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=softmax_scale, causal=True, window_size=(-1, -1), alibi_slopes=None, deterministic=True)
+
+
+        attn = torch.matmul(q, k.transpose(-2, -1)) * softmax_scale
+        attn = self.apply_right_aligned_causal_mask(attn)
+
+        attn = self.apply_window_masks(attn, self.iblock)
+
+        if self.config.self_extend:
+            attn_g = torch.matmul(q_g, k_g.transpose(-2, -1)) * softmax_scale
+            attn_g = self.apply_right_aligned_causal_mask(attn_g)
+
+            attn = self.apply_right_aligned_se_merge(attn, attn_g, se_w_size)
+
+        attn = self.softmax_like(attn)
+
+        out = torch.matmul(attn, v)
+
+        return out
+
+    def softmax_like(self, scores):
+        if self.config.softmax_like == "score_threshold":
+            thr, _ = scores.max(dim=-1)
+            thr = thr - self.thr_c[None, :, None]
+            thr = thr.unsqueeze(-1)
+            scores = torch.where(scores < thr, float("-inf"), scores)
+            return F.softmax(scores, dim=-1)
+        elif self.config.softmax_like == "soft_score_threshold":
+            thr, _ = scores.max(dim=-1)
+            thr = thr - self.thr_c[None, :, None]
+            m = torch.sigmoid((scores - thr.unsqueeze(-1)) * self.stp[None, :, None, None])
+            scores = scores + torch.log(m + 1e-8)
+            return F.softmax(scores, dim=-1)
+        else:
+            return F.softmax(scores, dim=-1)
+
+    def apply_right_aligned_causal_mask(self, attn_scores):
+        # Get the sizes of T_q (queries) and T_k (keys)
+        T_q = attn_scores.size(-2)
+        T_k = attn_scores.size(-1)
+        device = attn_scores.device
+
+        # Generate indices for T_q and T_k
+        i = torch.arange(T_q, device=device).unsqueeze(-1)  # Shape: (T_q, 1)
+        j = torch.arange(T_k, device=device).unsqueeze(0)  # Shape: (1, T_k)
+
+        # Create the right-aligned causal mask
+        causal_mask = (i + (T_k - T_q)) >= j  # Shape: (T_q, T_k)
+
+        # Apply the mask to the attention scores
+        attn_scores = attn_scores.masked_fill(~causal_mask, float('-inf'))
+
+        return attn_scores
+
+    def apply_window_masks(self, attn_scores, iblock):
+
+        t_end = attn_scores.shape[-1]
+        t_start = attn_scores.shape[-1] - attn_scores.shape[-2]
+        device = attn_scores.device
+
+        if self.training and self.local_heads_during_training > 0:
+            if self.local_heads_random:
+                head_indices = torch.randperm(self.n_head)[:self.local_heads_during_training]
+            else:
+                head_indices = torch.arange(self.local_heads_during_training, device=device)
+            local_heads_mask = torch.zeros(self.n_head, device=device, dtype=torch.bool)
+            local_heads_mask[head_indices] = True
+
+            i = torch.arange(t_start, t_end, device=device).view(-1, 1)
+            j = torch.arange(0, t_end, device=device).view(1, -1)
+            local_mask = (i - j >= self.aug_window_size).bool()
+            local_mask = local_mask.unsqueeze(0).unsqueeze(0)
+            local_heads_mask_expanded = local_heads_mask.view(1, self.n_head, 1, 1)
+            attn_scores = attn_scores.masked_fill(local_heads_mask_expanded & local_mask, float('-inf'))
+
+        return attn_scores
+
+
 @dataclass
 class GPTConfig:
     block_size: int = 1024
@@ -188,7 +287,24 @@ class GPTConfig:
     base_scale: float = 1.0 / (1024.0 ** 0.5)    # 1 / sqrt(n_embd)
     use_nGPT: int = 0
     dropout: float = 0.0
-    bias: bool = False 
+    bias: bool = False
+
+    use_flash_attn: bool = False
+
+    attn_chunked: bool = False
+    attn_chunk_size: int = 256
+
+    self_extend: bool = False
+    self_extend_window_size: int = 512
+    self_extend_group_multiplier: int = 32
+
+    softmax_like: str = "softmax"
+
+    learned_threshold: bool = False
+
+    local_heads_during_training: int = 0
+    local_heads_random: bool = False
+    aug_window_size: int = 128
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, embdim: int, eps: float = 1e-6) -> None:

@@ -76,6 +76,14 @@ batch_size = 8 # if gradient_accumulation_steps > 1, this is the micro-batch siz
 # model
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+#extra params
+use_flash_attn = True
+softmax_like = 'softmax'
+learned_threshold = False
+
+local_heads_during_training = 0
+local_heads_random = False
+aug_window_size = 128
 # adamw optimizer
 max_iters = 600000 # total number of training iterations
 beta1 = 0.9
@@ -176,10 +184,11 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 tdataloading_begin = time.time()
-if os.path.exists('./../../data'):
-    data_dir = os.path.join('./../../data', dataset)
-else:   
-    data_dir = os.path.join('data', dataset)
+#if os.path.exists('./../../data'):
+#    data_dir = os.path.join('./../../data', dataset)
+#else:
+#    data_dir = os.path.join('data', dataset)
+data_dir = dataset
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 
@@ -218,7 +227,10 @@ print("Data loading time: %f sec" % (time.time()-tdataloading_begin))
 # model init
 tmodelinit_begin = time.time()
 model_args = dict(use_nGPT=use_nGPT, n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size, base_scale=base_scale, 
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout,
+                  softmax_like=softmax_like, learned_threshold=learned_threshold, use_flash_attn=use_flash_attn,
+                    local_heads_during_training=local_heads_during_training, local_heads_random=local_heads_random, aug_window_size=aug_window_size)
+                   # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
