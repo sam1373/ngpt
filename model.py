@@ -143,7 +143,7 @@ class Block(nn.Module):
         #k = k.transpose(2, 1)
 
         if (self.config.use_nGPT == 1):
-            sqk = (self.sqk * (self.sqk_init_value/self.sqk_init_scaling)).view(1, 1, self.config.n_head, self.config.n_embd // self.config.n_head)
+            sqk = (self.sqk * (self.sqk_init_value/self.sqk_init_scaling)).view(1, self.config.n_head, 1, self.config.n_embd // self.config.n_head)
             q = sqk * self.justnorm(q)  
             k = sqk * self.justnorm(k)  
 
@@ -200,6 +200,9 @@ class Block(nn.Module):
             return self.attn_func(q, k, v, softmax_scale, q_g, k_g)
 
     def attn_func(self, q, k, v, softmax_scale=1.0, q_g=None, k_g=None, se_w_size=None):
+        #q - b, h, t, d
+        #v - b, t, h, d
+
         if self.config.use_flash_attn:
             q = q.transpose(2, 1)
             k = k.transpose(2, 1)
@@ -207,6 +210,7 @@ class Block(nn.Module):
 
 
         attn = torch.matmul(q, k.transpose(-2, -1)) * softmax_scale
+        #b, h, t, t
         attn = self.apply_right_aligned_causal_mask(attn)
 
         attn = self.apply_window_masks(attn, self.iblock)
@@ -219,8 +223,10 @@ class Block(nn.Module):
 
         attn = self.softmax_like(attn)
 
-        out = torch.matmul(attn, v)
+        out = torch.matmul(attn, v.tranpose(1, 2))
+        #out - b, h, t, d
         out = out.transpose(1, 2)
+        #b, t, h, d
 
         return out
 
