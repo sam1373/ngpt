@@ -43,19 +43,8 @@ try:
 except ImportError:
     flash_attn_func = None
 
-
+"""
 def apply_rotary_position_embeddings(sinusoidal_pos, q, k):
-    """
-    Apply rotary position embeddings to query and key tensors.
-
-    Args:
-        sinusoidal_pos (torch.Tensor): The sinusoidal positional embeddings of shape (..., 2 * d).
-        q (torch.Tensor): Query tensor of shape (B, n_head, T, d).
-        k (torch.Tensor): Key tensor of shape (B, n_head, T, d).
-
-    Returns:
-        (torch.Tensor, torch.Tensor): The rotated query and key tensors.
-    """
     # Split the sinusoidal_pos into sin and cos parts
     sin, cos = sinusoidal_pos.chunk(2, dim=-1)
 
@@ -77,6 +66,26 @@ def apply_rotary_position_embeddings(sinusoidal_pos, q, k):
     k_rot = torch.reshape(k_rot, k.shape)
 
     return q_rot, k_rot
+"""
+
+def apply_rotary_position_embeddings(sinusoidal_pos, q):
+
+    # assume right-aligned
+    if sinusoidal_pos.shape[0] != q.shape[2]:
+        # print(f"angles shape {angles.shape} is not equal to t shape {t.shape}")
+        sinusoidal_pos = sinusoidal_pos[-q.shape[2]:]
+
+    sin, cos = sinusoidal_pos.chunk(2, dim=-1)
+
+    q_rot = torch.stack((-q[..., 1::2], q[..., ::2]), dim=-1)
+
+    q_rot = torch.reshape(q_rot, q.shape[:-1] + (q.shape[-1] // 2, 2))
+
+    q_rot = q_rot * torch.stack((cos, sin), dim=-1)
+
+    q_rot = torch.reshape(q_rot, q.shape)
+
+    return q_rot
 
 
 def get_sinusoidal_embeddings(n_positions, dim):
@@ -126,14 +135,14 @@ class Block(nn.Module):
         self.mlp_c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias, dtype=torch.bfloat16)
 
         self.iblock = iblock
+        self.n_head = self.config.n_head
 
         # Softmax-like configuration for thresholding
         if self.config.softmax_like in ['soft_score_threshold', 'score_threshold']:
-            self.thr_c = nn.Parameter(2.0 * torch.ones(self.config.n_head, dtype=torch.float32),
+            self.thr_c = nn.Parameter(1.6 * torch.ones(self.config.n_head, dtype=torch.float32),
                                       requires_grad=self.config.learned_threshold)
             self.stp = nn.Parameter(10.0 * torch.ones(self.config.n_head, dtype=torch.float32), requires_grad=False)
-            print("thr_c:", self.thr_c)
-            print("stp:", self.stp)
+
 
         # Normalization and scaling depending on use_nGPT
         if self.config.use_nGPT == 0:
@@ -209,19 +218,52 @@ class Block(nn.Module):
         k = k.view(B, T, self.config.n_head, self.config.n_embd // self.config.n_head)
         v = v.view(B, T, self.config.n_head, self.config.n_embd // self.config.n_head)
 
+
         total_length = T
         if past_key_value is not None:
             past_k, past_v = past_key_value
             total_length = past_k.shape[1] + T
 
+
+        if past_key_value is not None:
+            k0, v0 = past_key_value
+            k = torch.cat([k0, k], dim=1)
+            v = torch.cat([v0, v], dim=1)
+
+        if use_cache:
+            past_key_value = (k, v)
+
         # Compute sinusoidal embeddings for rotary position embeddings
-        sinusoidal_pos = get_sinusoidal_embeddings(total_length, self.config.n_embd // self.config.n_head).to(device=q.device)
-        q_pos = sinusoidal_pos[-T:]
-        # k_pos is identical to q_pos here
-        k_pos = q_pos
+        pos = get_sinusoidal_embeddings(total_length, self.config.n_embd // self.config.n_head).to(device=q.device)
+
+        use_self_extend = self.config.self_extend and T > self.config.block_size
+
+        if use_self_extend:
+            denominator = max((self.config.block_size - self.config.self_extend_window_size), 1)
+            g_size = ((k.shape[2] - self.config.self_extend_window_size + denominator - 1) //
+                      denominator * self.config.self_extend_group_multiplier)
+            g_size = max(g_size, 1)
+
+            w_size = self.config.self_extend_window_size
+
+            g_pos = pos // g_size
+            shift = w_size - (w_size // g_size)
+            s_g_pos = g_pos + shift
+
+            q_g = apply_rotary_position_embeddings(s_g_pos, q.transpose(1, 2))
+            k_g = apply_rotary_position_embeddings(s_g_pos, k.transpose(1, 2))
+
+            q_g = q_g.to(dtype=torch.bfloat16)
+            k_g = k_g.to(dtype=torch.bfloat16)
+        else:
+            q_g, k_g = None, None
 
         # Apply rotary position embeddings
-        q, k = apply_rotary_position_embeddings(q_pos, q.transpose(1, 2), k.transpose(1, 2))
+        #q, k = apply_rotary_position_embeddings(pos, q.transpose(1, 2), k.transpose(1, 2))
+        q = apply_rotary_position_embeddings(pos, q.transpose(1, 2))
+        k = apply_rotary_position_embeddings(pos, k.transpose(1, 2))
+
+        #q *= 1.3
 
         if self.config.use_nGPT == 1:
             # Apply nGPT scaling on Q and K
@@ -231,28 +273,18 @@ class Block(nn.Module):
             q = sqk * self.justnorm(q)
             k = sqk * self.justnorm(k)
 
-        # Handle past key values for cache
-        if past_key_value is not None:
-            k = k.transpose(1, 2)
-            v = v.transpose(1, 2)
-            k = torch.cat([past_key_value[0], k], dim=1)
-            v = torch.cat([past_key_value[1], v], dim=1)
-            q = q.transpose(1, 2)
-        else:
-            q = q.transpose(1, 2)
-            k = k.transpose(1, 2)
-            v = v.transpose(1, 2)
+            if use_self_extend:
+                q_g = sqk * self.justnorm(q_g)
+                k_g = sqk * self.justnorm(k_g)
 
-        # Ensure causal: truncate k, v if needed
-        T_q = q.size(1)
-        T_k = k.size(1)
-        if T_k > T_q:
-            k = k[:, :T_q, :, :]
-            v = v[:, :T_q, :, :]
+        #q *= 1.3
+        #if q_g is not None:
+        #    q_g *= 1.3
 
         # Perform attention
         y = self.attn_maybe_extended(q.to(dtype=torch.bfloat16), k.to(dtype=torch.bfloat16),
-                                     v.to(dtype=torch.bfloat16), softmax_scale=softmax_scale)
+                                     v.to(dtype=torch.bfloat16), softmax_scale=softmax_scale,
+                                     q_g=q_g, k_g=k_g)
         y = y.to(dtype=q.dtype)
         y = y.contiguous().view(B, T, C)
 
@@ -292,8 +324,7 @@ class Block(nn.Module):
             res = A_norm + lr * (B_norm - A_norm)
             h = self.justnorm(res)
 
-        present_key_value = (k, v) if use_cache else None
-        return h, present_key_value
+        return h, past_key_value
 
     def attn_maybe_extended(self, q, k, v, softmax_scale, q_g=None, k_g=None):
         """
@@ -307,6 +338,7 @@ class Block(nn.Module):
         Returns:
             torch.Tensor: The attention output.
         """
+
         if self.config.attn_chunked:
             B, T, nH, d = q.shape
             chunk_size = self.config.attn_chunk_size
@@ -314,7 +346,14 @@ class Block(nn.Module):
             for start in range(0, T, chunk_size):
                 end = start + chunk_size
                 q_chunk = q[:, start:end, :, :]
-                out_chunk = self.attn_func(q_chunk, k, v, softmax_scale=softmax_scale, q_g=q_g, k_g=k_g,
+                k_chunk = k[:, :end, :, :]
+                v_chunk = v[:, :end, :, :]
+                if q_g is not None:
+                    q_g_chunk = q_g[:, start:end, :, :]
+                    k_g_chunk = k_g[:, :end, :, :]
+                else:
+                    q_g_chunk, k_g_chunk = None
+                out_chunk = self.attn_func(q_chunk, k_chunk, v_chunk, softmax_scale=softmax_scale, q_g=q_g_chunk, k_g=k_g_chunk,
                                            se_w_size=self.config.self_extend_window_size)
                 outs.append(out_chunk)
             return torch.cat(outs, dim=1)
@@ -336,8 +375,8 @@ class Block(nn.Module):
             torch.Tensor: Attention output of shape (B, T, n_head, head_dim).
         """
         # Transpose to (B, n_head, T, head_dim) for standard attention computation
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
+        #q = q.transpose(1, 2)
+        #k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
         if self.config.use_flash_attn and flash_attn_func is not None:
@@ -517,7 +556,7 @@ class GPTConfig:
     attn_chunk_size: int = 256
 
     self_extend: bool = False
-    self_extend_window_size: int = 512
+    self_extend_window_size: int = 128
     self_extend_group_multiplier: int = 32
 
     softmax_like: str = "softmax"
@@ -702,7 +741,7 @@ class GPT(nn.Module):
         print(f"using fused AdamW: {use_fused}")
         return optimizer
 
-    def generate(self, idx, max_new_tokens=50, temperature=1.0, top_k=None):
+    def generate(self, idx, max_new_tokens=50, temperature=1.0, top_k=None, decode=None):
         """
         Generate text from the model given an initial prompt.
 
@@ -720,7 +759,14 @@ class GPT(nn.Module):
             # Initial pass with the entire prompt
             logits, _, past_key_values = self(idx, use_cache=True)
 
-            for _ in range(max_new_tokens):
+            probs = F.softmax(logits[-1], dim=-1)
+            next_token = torch.argmax(probs, dim=-1, keepdim=True)
+            idx = torch.cat((idx, next_token), dim=1)
+
+            if decode is not None:
+                print("predicted:", decode(next_token[0].tolist()))
+
+            for _ in range(max_new_tokens - 1):
                 # Generate one token at a time
                 logits, _, past_key_values = self(idx[:, -1:], past_key_values=past_key_values, use_cache=True)
                 logits = logits[:, -1, :] / temperature
@@ -734,5 +780,8 @@ class GPT(nn.Module):
                 probs = F.softmax(logits, dim=-1)
                 next_token = torch.argmax(probs, dim=-1, keepdim=True)
                 idx = torch.cat((idx, next_token), dim=1)
+
+                if decode is not None:
+                    print("predicted:", decode(next_token[0].tolist()))
 
         return idx
